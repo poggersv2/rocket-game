@@ -7,7 +7,7 @@
 // ---------- Pins ----------
 #define PIN_SDA     21
 #define PIN_SCL     22
-#define PIN_FRONT   15
+#define PIN_FRONT   4
 #define PIN_BACK    2
 #define PIN_DHT     19
 
