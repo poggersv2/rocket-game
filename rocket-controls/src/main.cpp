@@ -8,318 +8,187 @@
 #define PIN_SDA     21
 #define PIN_SCL     22
 #define PIN_FRONT   4
-#define PIN_BACK    2
+#define PIN_BACK    27
 #define PIN_DHT     19
+#define PIN_POT     34   // ADC1, analog only
+#define PIN_ENC_CLK 32   // encoder A
+#define PIN_ENC_DT  33   // encoder B
+#define PIN_ENC_SW  18   // encoder push button
+#define PIN_BUZZER  25
+
+// ---------- Buzzer ----------
+// 1 = passive buzzer (we generate the tone, pitch can change)
+// 0 = active buzzer (fixed built-in tone, on/off only)
+#define BUZZER_PASSIVE 1
+
+unsigned long buzzerOffAt = 0;
+
+void beep(unsigned int freq, unsigned int ms) {
+#if BUZZER_PASSIVE
+  tone(PIN_BUZZER, freq, ms);
+#else
+  digitalWrite(PIN_BUZZER, HIGH);
+  buzzerOffAt = millis() + ms;
+#endif
+}
+
+// ---------- Encoder behaviour ----------
+#define ENC_STEPS_PER_DETENT 4   // 4 for most encoders (KY-040); use 2 or 1 if it skips
+#define ENC_DIR              1   // set to -1 to reverse direction
+#define ENC_MIN              0   // lowest value (clamped)
+#define ENC_MAX              100 // highest value (clamped)
+#define ENC_RESET_VALUE      0   // value set when the knob is pressed
+
+volatile int32_t encRaw = 0;
+volatile uint8_t encState = 0;
+
+// Quadrature state table: index = (previous AB << 2) | current AB
+static const int8_t ENC_TABLE[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
+
+void IRAM_ATTR encISR() {
+  encState = ((encState << 2) |
+              (digitalRead(PIN_ENC_CLK) << 1) |
+               digitalRead(PIN_ENC_DT)) & 0x0F;
+  encRaw += ENC_DIR * ENC_TABLE[encState];
+}
+
+// Encoder push button (debounced, active-low)
+bool encBtnStable = false;
+bool encBtnLast = false;
+unsigned long encBtnChange = 0;
 
 // ---------- Display ----------
-#define SCREEN_W    128
-#define SCREEN_H    64
-#define OLED_ADDR   0x3C
-
-Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
 bool oledOk = false;
 
 // ---------- DHT11 ----------
 DHT dht(PIN_DHT, DHT11);
-
 float temperature = NAN;
 float humidity = NAN;
-
 unsigned long lastDhtRead = 0;
-const unsigned long DHT_INTERVAL = 2000;
 
-// ---------- Pages ----------
-enum Page {
-  PAGE_DHT,
-  PAGE_SWITCH,
-  PAGE_I2C,
-  PAGE_COUNT
-};
-
-int currentPage = PAGE_DHT;
-
-// ---------- Button with debounce ----------
-struct Button {
-  uint8_t pin;
-  bool stable = false;
-  bool lastRead = false;
-  bool pressedEvent = false;
-  unsigned long lastChange = 0;
-
-  void begin(uint8_t p) {
-    pin = p;
-    pinMode(pin, INPUT_PULLUP);
-
-    // Initialise the state from the actual pin
-    stable = (digitalRead(pin) == LOW);
-    lastRead = stable;
-    lastChange = millis();
-  }
-
-  void update() {
-    bool reading = (digitalRead(pin) == LOW);
-
-    if (reading != lastRead) {
-      lastChange = millis();
-      lastRead = reading;
-    }
-
-    if (millis() - lastChange >= 30 && reading != stable) {
-      stable = reading;
-
-      if (stable) {
-        pressedEvent = true;
-      }
-    }
-  }
-
-  bool wasPressed() {
-    if (pressedEvent) {
-      pressedEvent = false;
-      return true;
-    }
-
-    return false;
-  }
-};
-
-Button btnFront, btnBack;
-
-// ---------- I2C scan ----------
-uint8_t foundAddrs[16];
-int foundCount = 0;
-
-void scanI2C() {
-  foundCount = 0;
-
-  for (uint8_t addr = 1; addr < 127 && foundCount < 16; addr++) {
-    Wire.beginTransmission(addr);
-
-    if (Wire.endTransmission() == 0) {
-      foundAddrs[foundCount++] = addr;
-    }
-  }
-
-  Serial.printf("[I2C] Found %d device(s)\n", foundCount);
-
-  for (int i = 0; i < foundCount; i++) {
-    Serial.printf("  Address: 0x%02X\n", foundAddrs[i]);
-  }
-}
-
-// ---------- Drawing ----------
-void drawHeader(const char *title) {
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-
-  display.print(title);
-
-  display.setCursor(104, 0);
-  display.printf("%d/%d", currentPage + 1, (int)PAGE_COUNT);
-
-  display.drawFastHLine(0, 10, SCREEN_W, SSD1306_WHITE);
-}
-
-void drawDhtPage() {
-  drawHeader("DHT11");
-
-  display.setTextSize(2);
-  display.setCursor(0, 18);
-
-  if (isnan(temperature)) {
-    display.print("T: --");
-  } else {
-    display.printf("T:%.0f C", temperature);
-  }
-
-  display.setCursor(0, 42);
-
-  if (isnan(humidity)) {
-    display.print("H: --");
-  } else {
-    display.printf("H:%.0f %%", humidity);
-  }
-}
-
-void drawSwitchPage() {
-  drawHeader("SWITCH");
-
-  display.setTextSize(2);
-  display.setCursor(0, 18);
-  display.printf("Front:%s", btnFront.stable ? "ON" : "off");
-
-  display.setCursor(0, 42);
-  display.printf("Back :%s", btnBack.stable ? "ON" : "off");
-}
-
-void drawI2cPage() {
-  drawHeader("I2C BUS");
-
-  display.setTextSize(1);
-  display.setCursor(0, 14);
-  display.printf("SDA:%d SCL:%d", PIN_SDA, PIN_SCL);
-
-  display.setCursor(0, 26);
-  display.printf("Found: %d device(s)", foundCount);
-
-  for (int i = 0; i < foundCount && i < 4; i++) {
-    display.setCursor(0, 38 + i * 9);
-    display.printf("0x%02X", foundAddrs[i]);
-  }
-}
-
-void render() {
-  if (!oledOk) return;
-
-  display.clearDisplay();
-
-  switch (currentPage) {
-    case PAGE_DHT:
-      drawDhtPage();
-      break;
-
-    case PAGE_SWITCH:
-      drawSwitchPage();
-      break;
-
-    case PAGE_I2C:
-      drawI2cPage();
-      break;
-  }
-
-  display.display();
-}
-
-// ---------- Serial page information ----------
-void printPageToSerial() {
-  switch (currentPage) {
-    case PAGE_DHT:
-      Serial.printf("[DHT11] Temp: %.1f C  Humidity: %.1f %%\n",
-                    temperature, humidity);
-      break;
-
-    case PAGE_SWITCH:
-      Serial.printf("[SWITCH] Front: %s  Back: %s\n",
-                    btnFront.stable ? "ON" : "off",
-                    btnBack.stable ? "ON" : "off");
-      break;
-
-    case PAGE_I2C:
-      Serial.printf("[I2C] %d device(s) found\n", foundCount);
-      break;
-  }
-}
-
-// ---------- Change page ----------
-void changePage(int delta) {
-  int oldPage = currentPage;
-
-  currentPage = (currentPage + delta + PAGE_COUNT) % PAGE_COUNT;
-
-  Serial.printf("[NAV] Page %d -> Page %d\n",
-                oldPage + 1, currentPage + 1);
-
-  if (currentPage == PAGE_I2C) {
-    scanI2C();
-  }
-
-  printPageToSerial();
-  render();
-}
-
-// ---------- Arduino setup ----------
 void setup() {
   Serial.begin(115200);
-  delay(500);
 
-  Serial.println();
-  Serial.println("===== ESP32 STARTING =====");
+  pinMode(PIN_FRONT, INPUT_PULLUP);
+  pinMode(PIN_BACK, INPUT_PULLUP);
 
-  btnFront.begin(PIN_FRONT);
-  btnBack.begin(PIN_BACK);
+  pinMode(PIN_ENC_CLK, INPUT_PULLUP);
+  pinMode(PIN_ENC_DT, INPUT_PULLUP);
+  pinMode(PIN_ENC_SW, INPUT_PULLUP);
 
-  Serial.printf("[SETUP] Front button GPIO: %d\n", PIN_FRONT);
-  Serial.printf("[SETUP] Back button GPIO: %d\n", PIN_BACK);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  // Seed the decoder with the current pin state, then listen for changes
+  encState = (digitalRead(PIN_ENC_CLK) << 1) | digitalRead(PIN_ENC_DT);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_CLK), encISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_DT), encISR, CHANGE);
 
   Wire.begin(PIN_SDA, PIN_SCL);
-
   dht.begin();
 
-  oledOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  oledOk = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  if (!oledOk) Serial.println("OLED not found at 0x3C");
 
-  if (!oledOk) {
-    Serial.println("[ERROR] OLED not found at 0x3C");
-  } else {
-    Serial.println("[OK] OLED initialised");
-  }
-
-  scanI2C();
-
-  Serial.println("[SETUP] Ready. Press either button to navigate.");
-
-  render();
+  beep(2000, 80);  // startup chirp
 }
 
-// ---------- Main loop ----------
 void loop() {
-  // Update button states
-  btnFront.update();
-  btnBack.update();
-
-  // Debug raw back-button pin
-  static int lastBackRaw = HIGH;
-  int backRaw = digitalRead(PIN_BACK);
-
-  if (backRaw != lastBackRaw) {
-    Serial.printf("[DEBUG] Back GPIO %d: %s\n",
-                  PIN_BACK,
-                  backRaw == LOW ? "PRESSED" : "RELEASED");
-
-    lastBackRaw = backRaw;
-  }
-
-  // Front button moves forward
-  if (btnFront.wasPressed()) {
-    Serial.println("[DEBUG] Front button event detected");
-    changePage(+1);
-  }
-
-  // Back button moves backward
-  if (btnBack.wasPressed()) {
-    Serial.println("[DEBUG] Back button event detected");
-
-    Serial.printf("[DEBUG] Page before: %d\n", currentPage + 1);
-
-    changePage(-1);
-
-    Serial.printf("[DEBUG] Page after: %d\n", currentPage + 1);
-  }
-
-  // Read DHT11 every two seconds
-  if (millis() - lastDhtRead >= DHT_INTERVAL) {
+  // Read DHT11 every 2 seconds, keep last good values
+  if (millis() - lastDhtRead >= 2000) {
     lastDhtRead = millis();
-
     float t = dht.readTemperature();
     float h = dht.readHumidity();
-
     if (!isnan(t) && !isnan(h)) {
       temperature = t;
       humidity = h;
-    } else {
-      Serial.println("[DEBUG] DHT11 read failed");
-    }
-
-    if (currentPage == PAGE_DHT) {
-      printPageToSerial();
     }
   }
 
-  // Refresh OLED every 100 ms
-  static unsigned long lastRender = 0;
+  // Switch (pressed/flipped = 1)
+  int front = digitalRead(PIN_FRONT) == LOW;
+  int back  = digitalRead(PIN_BACK) == LOW;
 
-  if (millis() - lastRender >= 100) {
-    lastRender = millis();
-    render();
+  int pot = analogRead(PIN_POT);
+
+  // Encoder push button: debounce, press resets the value
+  bool r = (digitalRead(PIN_ENC_SW) == LOW);
+  if (r != encBtnLast) {
+    encBtnLast = r;
+    encBtnChange = millis();
   }
+  if (millis() - encBtnChange >= 30 && r != encBtnStable) {
+    encBtnStable = r;
+    if (encBtnStable) {
+      noInterrupts();
+      encRaw = ENC_RESET_VALUE * ENC_STEPS_PER_DETENT;
+      interrupts();
+      beep(1000, 120);  // knob pressed
+    }
+  }
+
+  // Encoder value: clamp, then convert steps to detents
+  noInterrupts();
+  if (encRaw > ENC_MAX * ENC_STEPS_PER_DETENT) encRaw = ENC_MAX * ENC_STEPS_PER_DETENT;
+  if (encRaw < ENC_MIN * ENC_STEPS_PER_DETENT) encRaw = ENC_MIN * ENC_STEPS_PER_DETENT;
+  int32_t raw = encRaw;
+  interrupts();
+  int enc = raw / ENC_STEPS_PER_DETENT;
+
+  // Beeps on changes
+  static int lastEnc = 0, lastFront = 0, lastBack = 0;
+  if (enc != lastEnc) {
+    lastEnc = enc;
+    beep(map(enc, ENC_MIN, ENC_MAX, 500, 2500), 15);  // pitch follows the value
+  }
+  if (front != lastFront || back != lastBack) {
+    lastFront = front;
+    lastBack = back;
+    beep(front ? 1500 : 800, 60);  // switch flipped
+  }
+
+#if !BUZZER_PASSIVE
+  if (buzzerOffAt && millis() >= buzzerOffAt) {
+    digitalWrite(PIN_BUZZER, LOW);
+    buzzerOffAt = 0;
+  }
+#endif
+
+  // Serial
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 1000) {
+    lastPrint = millis();
+    Serial.printf("%.1f %.1f %d %d %d %d %d\n",
+                  temperature, humidity, front, back, pot, enc, encBtnStable);
+  }
+
+  // OLED: raw values only, refreshed every 100 ms
+  static unsigned long lastDraw = 0;
+  if (oledOk && millis() - lastDraw >= 100) {
+    lastDraw = millis();
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+
+    display.setCursor(0, 0);
+    display.printf("Temp: %.0f", temperature);
+    display.setCursor(0, 10);
+    display.printf("Hum: %.0f", humidity);
+    display.setCursor(0, 20);
+    display.printf("F:%d B:%d", front, back);
+    display.setCursor(0, 30);
+    display.printf("Pot: %d", pot);
+    display.setCursor(0, 40);
+    display.printf("Enc: %d Sw:%d", enc, encBtnStable);
+
+    display.display();
+  }
+
+  delay(1);
 }
