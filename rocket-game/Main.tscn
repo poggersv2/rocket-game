@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://dachpgdng8fak"]
+
+[ext_resource type="Script" uid="uid://ewvhipt25ehe" path="res://main.gd" id="1_main"]
+
+[node name="RocketLaunchSimulator" type="Node3D" unique_id=449728287]
+script = ExtResource("1_main")
